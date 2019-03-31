@@ -1,1 +1,1 @@
-include ':sample', ':quickscanner'
+include ':quickscanner', ':sample'
