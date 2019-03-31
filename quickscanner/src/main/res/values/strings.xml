@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">QuickStanneR</string>
+    <string name="title_result_non_url">Scanning result</string>
+    <string name="message_copy">copy</string>
+    <string name="cancel">Cancel</string>
+    <string name="accept_me">Please accept accessing to your storage to use this application from settings</string>
 </resources>
