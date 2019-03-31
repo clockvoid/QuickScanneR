@@ -16,16 +16,17 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
-import android.view.View
 import android.widget.Toast
 import com.google.firebase.ml.vision.common.FirebaseVisionImage
 import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata
 import java.lang.IllegalStateException
 import java.util.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.NoSuchElementException
 import kotlin.experimental.inv
 
-class CameraScenePreview @JvmOverloads constructor(
+class CameraPreview @JvmOverloads constructor(
     @get:JvmName("_context")
     val context: Context,
     attrs: AttributeSet? = null,
@@ -40,6 +41,7 @@ class CameraScenePreview @JvmOverloads constructor(
     private lateinit var previewRequest: CaptureRequest
     private lateinit var cameraManager: CameraManager
     private lateinit var cameraId: String
+    private var threadPool: ExecutorService? = null
     private var cameraDevice: CameraDevice? = null
     private var ratioWidth = 0
     private var ratioHeight = 0
@@ -49,43 +51,53 @@ class CameraScenePreview @JvmOverloads constructor(
     var qrCodeCallback: (QRCodeValue) -> Unit = {}
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
-        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
         counter++
-        val firebaseImage = when (counter) {
-            20 -> FirebaseVisionImage.fromMediaImage(image, FirebaseVisionImageMetadata.ROTATION_0)
-            40 -> {
-                counter = 0
-                FirebaseVisionImage.fromByteArray(getNegativeYUVByteArray(image),
-                    FirebaseVisionImageMetadata.Builder().also {
-                        it.setWidth(image.width)
-                        it.setHeight(image.height)
-                        it.setFormat(FirebaseVisionImageMetadata.IMAGE_FORMAT_NV21)
-                        it.setRotation(FirebaseVisionImageMetadata.ROTATION_0)
-                    }.build())
+        threadPool?.execute {
+            val image = try {
+                reader.acquireLatestImage() ?: return@execute
+            } catch (exception: IllegalStateException) {
+                Log.d(TAG, "$exception")
+                return@execute
             }
-            else -> {
-                image.close()
-                return@OnImageAvailableListener
-            }
-        }
-        QRCodeDetector.detect(firebaseImage, {
-            Log.d(TAG, "barcodes: ${it.size}")
-            it.forEach { barcode ->
-                Log.d(TAG, "${barcode.rawValue}")
-                barcode.rawValue?.also { value ->
-                    qrCodeCallback(QRCodeValue.create(value))
+            val firebaseImage = when (counter) {
+                0 -> FirebaseVisionImage.fromMediaImage(image, FirebaseVisionImageMetadata.ROTATION_0)
+                10 -> {
+                    counter = -10
+                    FirebaseVisionImage.fromByteArray(
+                        getNegativeYUVByteArray(image),
+                        FirebaseVisionImageMetadata.Builder().also {
+                            it.setWidth(image.width)
+                            it.setHeight(image.height)
+                            it.setFormat(FirebaseVisionImageMetadata.IMAGE_FORMAT_NV21)
+                            it.setRotation(FirebaseVisionImageMetadata.ROTATION_0)
+                        }.build()
+                    )
+                }
+                else -> {
+                    image.close()
+                    return@execute
                 }
             }
-        }, { exception ->
-            Log.d(TAG, "error occurs: ${exception.stackTrace}")
-        })
-        image.close()
+            QRCodeDetector.detect(firebaseImage, {
+                it.forEach { barcode ->
+                    Log.d(TAG, "detect barcode: ${barcode.rawValue}")
+                    barcode.rawValue?.also { value ->
+                        qrCodeCallback(QRCodeValue.create(value))
+                    }
+                }
+            }, { exception ->
+                Log.d(TAG, "error occurs: ${exception.stackTrace}")
+            })
+            image.close()
+        }
     }
 
     private val cameraSurfaceTextureListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture?, width: Int, height: Int) {}
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture?, width: Int, height: Int) {
+        }
 
-        override fun onSurfaceTextureUpdated(surface: SurfaceTexture?) {}
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture?) {
+        }
 
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture?): Boolean = true
 
@@ -122,8 +134,8 @@ class CameraScenePreview @JvmOverloads constructor(
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-        val width = View.MeasureSpec.getSize(widthMeasureSpec)
-        val height = View.MeasureSpec.getSize(heightMeasureSpec)
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        val height = MeasureSpec.getSize(heightMeasureSpec)
         if (ratioWidth == 0 || ratioHeight == 0) {
             setMeasuredDimension(width, height)
         } else {
@@ -136,6 +148,7 @@ class CameraScenePreview @JvmOverloads constructor(
     }
 
     fun startCameraPreview() {
+        if (cameraDevice != null) return
         startBackgroundThread()
         if (this.isAvailable) {
             openCamera()
@@ -145,12 +158,15 @@ class CameraScenePreview @JvmOverloads constructor(
     }
 
     fun stopCameraPreview() {
-        stopBackgroundThread()
+        cameraDevice!!.close()
         captureSession.close()
+        stopBackgroundThread()
         imageReader.close()
+        cameraDevice = null
     }
 
     private fun startBackgroundThread() {
+        threadPool = Executors.newFixedThreadPool(3)
         backgroundThread = HandlerThread("CameraBackground")
         backgroundThread?.start()
         backgroundHandler = Handler(backgroundThread?.looper)
@@ -165,6 +181,10 @@ class CameraScenePreview @JvmOverloads constructor(
         } catch (e: Exception) {
             Log.e(TAG, e.toString())
         }
+        threadPool!!.shutdown()
+        while (!threadPool!!.isTerminated) {
+        }
+        threadPool = null
     }
 
     private fun setAspectRatio(width: Int, height: Int) {
@@ -208,7 +228,10 @@ class CameraScenePreview @JvmOverloads constructor(
         try {
             val surface = Surface(surfaceTexture)
             imageReader = ImageReader.newInstance(videoSize.width, videoSize.height,
-                ImageFormat.YUV_420_888, 1)
+                ImageFormat.YUV_420_888, 2)
+            surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            Log.d(TAG, "video size is ${videoSize.width}x${videoSize.height}")
+            Log.d(TAG, "preview size is ${previewSize.width}x${previewSize.height}")
             imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             previewRequestBuilder.addTarget(surface)
@@ -217,6 +240,7 @@ class CameraScenePreview @JvmOverloads constructor(
                 listOf(surface, imageReader.surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
+                        cameraDevice ?: return
                         captureSession = cameraCaptureSession
                         try {
                             previewRequestBuilder.set(
@@ -225,8 +249,8 @@ class CameraScenePreview @JvmOverloads constructor(
                             previewRequest = previewRequestBuilder.build()
                             captureSession.setRepeatingRequest(previewRequest,
                                 captureCallback, backgroundHandler)
-                        } catch (e: CameraAccessException) {
-                            Log.e("erfs", e.toString())
+                        } catch (exception: Exception) {
+                            Log.e("erfs", exception.toString())
                         }
                     }
 
@@ -282,7 +306,7 @@ class CameraScenePreview @JvmOverloads constructor(
         it.width == it.height * 4 / 3 && it.width <= 1080 } ?: choices[choices.size - 1]
 
     private fun chooseVideoSize(choices: Array<Size>) = choices.firstOrNull {
-        it.width in 145..480 && it.width % 10 == 0 } ?: choices[choices.size - 1]
+        it.width in 125..(if (Runtime.getRuntime().maxMemory() / 1024 / 1024 < 256) 380 else 730) && it.width == it.height * 4 / 3 } ?: choices[choices.size - 1]
 
     private class CompareSizesByArea : Comparator<Size> {
 
@@ -295,3 +319,4 @@ class CameraScenePreview @JvmOverloads constructor(
         private const val TAG = "camerasceenpreview"
     }
 }
+
